@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# Configuration locale & identifiants secrets
+.env
+
+# Cache de tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs et progression locale (seuls les fichiers .gitkeep sont conserves)
+logs/*.log
+logs/progress.json
+
+# Rapports generes
+reports/*.csv
+reports/*.json
+!reports/.gitkeep
+!logs/.gitkeep
+
+# IDEs
+.vscode/
+.idea/
