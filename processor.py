@@ -13,6 +13,7 @@ from mongodb_service import MongoDBService
 from search_service import SearchService
 from progress_manager import ProgressManager
 from report_manager import ReportManager
+from email_service import EmailService
 
 logger = logging.getLogger("instagram_automation.processor")
 
@@ -32,13 +33,15 @@ class AutomationProcessor:
         batch_size: int = 100,
         resume: bool = False,
         confidence_threshold: str = "HIGH",
-        only_with_website: Optional[bool] = None
+        only_with_website: Optional[bool] = None,
+        email_service: Optional[EmailService] = None
     ):
         self.config = config
         self.db_service = mongodb_service
         self.search_service = search_service
         self.progress_mgr = progress_manager
         self.report_mgr = report_manager
+        self.email_service = email_service or EmailService(config)
         self.dry_run = dry_run
         self.limit = limit
         self.batch_size = batch_size
@@ -237,5 +240,13 @@ class AutomationProcessor:
         # Sauvegarde du bilan JSON et affichage terminal
         self.report_mgr.save_final_summary(summary)
         self.report_mgr.print_terminal_summary(summary, remaining_in_db=remaining_in_db)
+
+        # Envoi automatique du rapport par email à l'administrateur
+        if self.email_service and self.config.smtp_enabled:
+            status_label = "ARRÊTÉ PAR UTILISATEUR" if self._interrupted else "SUCCÈS"
+            try:
+                self.email_service.send_summary_report(summary, status=status_label)
+            except Exception as e:
+                logger.warning(f"Impossible d'envoyer le rapport email de synthèse : {e}")
 
         return summary

@@ -21,7 +21,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from instagram_validator import (
     clean_instagram_url,
     validate_instagram_candidate,
-    ValidationResult
+    ValidationResult,
+    analyze_bio_for_business
 )
 from config import AppConfig
 
@@ -120,6 +121,60 @@ class SearchService:
 
         return results
 
+    def _fetch_instagram_profile_meta(self, instagram_url: str) -> dict:
+        """
+        Tente de récupérer les métadonnées publiques d'un profil Instagram
+        via les balises <meta> de sa page HTML publique (sans connexion requise).
+
+        Extrait :
+          - 'display_name' : nom affiché sur le profil (og:title)
+          - 'bio'          : biographie du compte (og:description)
+
+        Retourne un dict non vide si la page est accessible, sinon {} (neutre).
+        Le score textuel est conservé intact si Instagram est inaccessible.
+        """
+        try:
+            resp = self.session.get(
+                instagram_url,
+                timeout=6,
+                verify=False,
+                allow_redirects=True
+            )
+            if resp.status_code != 200 or not resp.text:
+                return {}
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            display_name = ""
+            bio = ""
+
+            # og:title → "Nom Affiché (@username) • Instagram photos et vidéos"
+            title_tag = soup.find("meta", property="og:title")
+            if title_tag and title_tag.get("content"):
+                title_content = title_tag["content"]
+                name_match = re.match(r"^(.+?)\s*\(@", title_content)
+                if name_match:
+                    display_name = name_match.group(1).strip()
+                else:
+                    display_name = title_content.split("•")[0].strip()
+
+            # og:description → contient généralement la biographie du compte
+            desc_tag = soup.find("meta", property="og:description")
+            if desc_tag and desc_tag.get("content"):
+                bio = desc_tag["content"]
+
+            if not display_name and not bio:
+                return {}
+
+            logger.debug(
+                f"Meta Instagram récupérées pour {instagram_url} : "
+                f"nom='{display_name}', bio='{bio[:60]}...'"
+            )
+            return {"display_name": display_name, "bio": bio}
+
+        except Exception as e:
+            logger.debug(f"Profil Instagram inaccessible '{instagram_url}': {e}")
+            return {}
+
     def search_duckduckgo_candidates(
         self,
         company_name: str,
@@ -129,6 +184,9 @@ class SearchService:
     ) -> List[str]:
         """
         Recherche plusieurs profils candidats via DuckDuckGo.
+        Effectue deux requêtes :
+        1. Une requête précise avec mots-clés business (officiel, entreprise, company)
+        2. Une requête générale en fallback si la première ne donne pas de résultats
         """
         candidates: List[str] = []
         try:
@@ -140,24 +198,46 @@ class SearchService:
                 except ImportError:
                     from duckduckgo_search import DDGS
 
-            query_parts = [f'"{company_name}"', "site:instagram.com"]
-            if location:
-                query_parts.append(location)
-            elif country_code:
-                query_parts.append(country_code)
+            geo = location or country_code or ""
 
-            query = " ".join(query_parts)
-            logger.debug(f"Requête DuckDuckGo : {query}")
+            # Requête 1 : précise avec mots-clés business pour éviter les profils personnels
+            business_keywords = "officiel OR official OR entreprise OR company OR business"
+            query_parts_precise = [f'"{company_name}"', "site:instagram.com", business_keywords]
+            if geo:
+                query_parts_precise.append(geo)
+            query_precise = " ".join(query_parts_precise)
+            logger.debug(f"Requête DuckDuckGo précise : {query_precise}")
 
+            seen: set = set()
             with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=max_results))
+                results_precise = list(ddgs.text(query_precise, max_results=max_results))
 
-            for r in results:
+            for r in results_precise:
                 href = r.get("href") or r.get("link", "")
                 if "instagram.com" in href.lower():
                     cleaned = clean_instagram_url(href)
-                    if cleaned and cleaned not in candidates:
+                    if cleaned and cleaned not in seen:
+                        seen.add(cleaned)
                         candidates.append(cleaned)
+
+            # Requête 2 : générale en fallback si la requête précise n'a rien trouvé
+            if not candidates:
+                query_parts_general = [f'"{company_name}"', "site:instagram.com"]
+                if geo:
+                    query_parts_general.append(geo)
+                query_general = " ".join(query_parts_general)
+                logger.debug(f"Requête DuckDuckGo générale (fallback) : {query_general}")
+
+                with DDGS() as ddgs:
+                    results_general = list(ddgs.text(query_general, max_results=max_results))
+
+                for r in results_general:
+                    href = r.get("href") or r.get("link", "")
+                    if "instagram.com" in href.lower():
+                        cleaned = clean_instagram_url(href)
+                        if cleaned and cleaned not in seen:
+                            seen.add(cleaned)
+                            candidates.append(cleaned)
 
         except Exception as e:
             logger.warning(f"Erreur lors de la recherche DuckDuckGo pour '{company_name}': {e}")
@@ -307,6 +387,45 @@ class SearchService:
         # Tri décroissant selon le pourcentage de similarité
         sorted_candidates = sorted(
             candidates_map.values(),
+            key=lambda x: x.similarity,
+            reverse=True
+        )
+
+        # --- Vérification de la biographie Instagram ---
+        # Pour chaque candidat issu du moteur de recherche, on tente de récupérer
+        # les métadonnées publiques du profil (nom affiché + bio) afin de confirmer
+        # qu'il s'agit bien d'un compte d'entreprise et non d'un profil personnel.
+        # Si Instagram est inaccessible, le score textuel est conservé intact (neutre).
+        top_to_verify = sorted_candidates[:max_candidates]
+        for res in top_to_verify:
+            # Les liens extraits du site officiel ne nécessitent pas de vérification bio
+            if res.clean_url and "official_website" not in res.reason:
+                meta = self._fetch_instagram_profile_meta(res.clean_url)
+                if meta:
+                    adjustment, bio_reason = analyze_bio_for_business(
+                        display_name=meta.get("display_name", ""),
+                        bio=meta.get("bio", ""),
+                        company_name=company_name
+                    )
+                    if adjustment != 0.0:
+                        new_sim = round(max(0.0, min(100.0, res.similarity + adjustment)), 1)
+                        new_conf = (
+                            "HIGH" if new_sim >= 90.0
+                            else ("MEDIUM" if new_sim >= 60.0 else "LOW")
+                        )
+                        res.similarity = new_sim
+                        res.confidence = new_conf
+                        res.reason = f"{res.reason} | Bio : {bio_reason}"
+                        logger.debug(
+                            f"Bio vérifiée pour @{res.username} : "
+                            f"ajustement {adjustment:+.1f}% → {new_sim:.1f}% ({new_conf})"
+                        )
+                # Délai de courtoisie entre les requêtes vers Instagram
+                time.sleep(1.0)
+
+        # Re-tri après vérification des bios (scores peuvent avoir changé)
+        sorted_candidates = sorted(
+            top_to_verify,
             key=lambda x: x.similarity,
             reverse=True
         )

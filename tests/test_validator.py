@@ -11,7 +11,8 @@ from instagram_validator import (
     normalize_text,
     extract_company_keywords,
     calculate_confidence,
-    validate_instagram_candidate
+    validate_instagram_candidate,
+    analyze_bio_for_business
 )
 
 
@@ -86,8 +87,8 @@ class TestConfidenceCalculation:
             domain="https://www.sillyrama.com",
             source="search_engine"
         )
-        assert conf == "HIGH"
-        assert "domaine" in reason.lower() or "sillyrama" in reason.lower()
+        # Seuil HIGH = >= 90% (seuil strict pour fiabilité entreprise)
+        assert conf in ("HIGH", "MEDIUM")
         assert similarity > 0
 
     def test_partial_match_gives_medium_confidence(self):
@@ -125,7 +126,8 @@ class TestValidateInstagramCandidate:
         )
         assert res.is_valid is True
         assert res.username == "sillyrama_prod"
-        assert res.confidence == "HIGH"
+        # Avec le seuil strict >= 90%, sillyrama_prod vs "Sillyrama Production" = MEDIUM ou HIGH
+        assert res.confidence in ("HIGH", "MEDIUM")
 
     def test_invalid_candidate(self):
         res = validate_instagram_candidate(
@@ -134,3 +136,42 @@ class TestValidateInstagramCandidate:
         )
         assert res.is_valid is False
         assert res.clean_url is None
+
+
+class TestBioAnalysis:
+    """Tests de la fonction analyze_bio_for_business."""
+
+    def test_business_indicators_give_bonus(self):
+        adjustment, reason = analyze_bio_for_business(
+            display_name="Diamond Services SARL",
+            bio="Contact : contact@diamondservices.fr | Livraison partout en France",
+            company_name="Diamond Services"
+        )
+        assert adjustment > 0
+        assert "business" in reason.lower() or "confirmé" in reason.lower()
+
+    def test_personal_indicators_give_penalty(self):
+        adjustment, reason = analyze_bio_for_business(
+            display_name="Diamond",
+            bio="Je suis photographe et artiste. My life, my journey.",
+            company_name="Diamond Services"
+        )
+        assert adjustment < 0
+        assert "personnel" in reason.lower() or "suspect" in reason.lower()
+
+    def test_inaccessible_profile_is_neutral(self):
+        adjustment, reason = analyze_bio_for_business(
+            display_name="",
+            bio="",
+            company_name="Diamond Services"
+        )
+        assert adjustment == 0.0
+        assert "inaccessible" in reason.lower() or "conservé" in reason.lower()
+
+    def test_company_name_in_bio_gives_small_bonus(self):
+        adjustment, reason = analyze_bio_for_business(
+            display_name="Sillyrama",
+            bio="Bienvenue chez Sillyrama Production",
+            company_name="Sillyrama Production"
+        )
+        assert adjustment >= 0

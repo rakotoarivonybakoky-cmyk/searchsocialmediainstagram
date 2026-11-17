@@ -168,13 +168,19 @@ class MongoDBService:
         }
 
         cursor = (
-            self.collection.find(query, projection=projection)
+            self.collection.find(query, projection=projection, no_cursor_timeout=True)
             .sort("_id", 1)
             .batch_size(batch_size)
         )
 
-        for doc in cursor:
-            yield doc
+        try:
+            for doc in cursor:
+                yield doc
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
 
     def verify_document_structure(self, doc: Dict[str, Any]) -> tuple[bool, str]:
         """

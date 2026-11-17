@@ -68,6 +68,17 @@ class AppConfig:
     logs_dir: Path
     progress_file: Path
 
+    # Configuration SMTP & Notifications
+    smtp_enabled: bool = False
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    smtp_use_tls: bool = True
+    smtp_use_ssl: bool = False
+    smtp_user: Optional[str] = None
+    smtp_password: Optional[str] = None
+    smtp_from: Optional[str] = None
+    admin_email: Optional[str] = None
+
     def get_masked_uri(self) -> str:
         """Retourne l'URI avec identifiants masqués."""
         return mask_mongodb_uri(self.mongodb_uri)
@@ -121,6 +132,20 @@ def load_config() -> AppConfig:
 
     log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 
+    # Configuration SMTP
+    smtp_enabled = os.getenv("SMTP_ENABLED", "false").strip().lower() in ("true", "1", "yes")
+    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com").strip()
+    try:
+        smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    except ValueError:
+        smtp_port = 587
+    smtp_use_tls = os.getenv("SMTP_USE_TLS", "true").strip().lower() in ("true", "1", "yes")
+    smtp_use_ssl = os.getenv("SMTP_USE_SSL", "false").strip().lower() in ("true", "1", "yes")
+    smtp_user = os.getenv("SMTP_USER", "").strip() or None
+    smtp_password = os.getenv("SMTP_PASSWORD", "").strip() or None
+    smtp_from = os.getenv("SMTP_FROM", "").strip() or None
+    admin_email = os.getenv("ADMIN_EMAIL", "").strip() or None
+
     cfg = AppConfig(
         mongodb_uri=uri,
         mongodb_db_name=db_name,
@@ -137,5 +162,14 @@ def load_config() -> AppConfig:
         reports_dir=REPORTS_DIR,
         logs_dir=LOGS_DIR,
         progress_file=PROGRESS_FILE,
+        smtp_enabled=smtp_enabled,
+        smtp_host=smtp_host,
+        smtp_port=smtp_port,
+        smtp_use_tls=smtp_use_tls,
+        smtp_use_ssl=smtp_use_ssl,
+        smtp_user=smtp_user,
+        smtp_password=smtp_password,
+        smtp_from=smtp_from,
+        admin_email=admin_email,
     )
     return cfg

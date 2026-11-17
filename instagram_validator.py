@@ -28,6 +28,30 @@ LEGAL_EXTENSIONS: Set[str] = {
     "nv", "sp", "spa", "z", "oo", "pte", "plc"
 }
 
+# Indicateurs caractéristiques d'un profil personnel (personne physique)
+PERSONAL_INDICATORS: Set[str] = {
+    "photographer", "photographe", "model", "modele", "influencer", "influenceur",
+    "blogger", "vlogger", "artist", "artiste", "musician", "musicien",
+    "singer", "chanteur", "chanteuse", "dancer", "danseur", "danseuse",
+    "actor", "acteur", "actrice", "i am", "je suis", "my life", "ma vie",
+    "personal", "personnel", "lifestyle", "my journey", "mon parcours",
+    "etudiant", "student", "passionnee", "passionné", "freelancer",
+    "content creator", "createur de contenu", "maman", "papa", "family",
+    "famille", "amoureux", "amoureuse", "fan de", "love",
+}
+
+# Indicateurs caractéristiques d'un compte professionnel / entreprise
+BUSINESS_INDICATORS: Set[str] = {
+    "official", "officiel", "contact", "services", "solutions", "entreprise",
+    "company", "shop", "store", "boutique", "www.", ".com", ".fr", ".net",
+    "email", "tel:", "tél:", "horaires", "hours", "menu", "devis",
+    "livraison", "delivery", "wholesale", "retail", "commande", "order",
+    "pro", "professionnel", "professional", "commerce", "commercial",
+    "agence", "agency", "cabinet", "bureau", "office", "siege",
+    "siège", "marque", "brand", "founded", "fondée", "fondé", "since",
+    "depuis", "@", "site:", "rdv", "rendez-vous", "appointment",
+}
+
 
 @dataclass
 class ValidationResult:
@@ -178,12 +202,76 @@ def calculate_confidence(
     if source == "official_website":
         return "HIGH", f"Lien extrait du site web officiel (similarité: {similarity}%).", similarity
 
-    if similarity >= 75.0:
+    if similarity >= 90.0:
         return "HIGH", f"Forte concordance ({similarity}%) entre l'entreprise et le compte '{username}'.", similarity
-    elif similarity >= 45.0:
+    elif similarity >= 60.0:
         return "MEDIUM", f"Concordance modérée ({similarity}%) avec le compte '{username}'.", similarity
     else:
         return "LOW", f"Faible ressemblance ({similarity}%) entre l'entreprise et le compte '{username}'.", similarity
+
+
+def analyze_bio_for_business(
+    display_name: str,
+    bio: str,
+    company_name: str
+) -> tuple:
+    """
+    Analyse la biographie et le nom affiché d'un profil Instagram pour déterminer
+    s'il s'agit d'un compte d'entreprise ou d'un profil personnel.
+
+    Retourne un tuple (score_adjustment: float, raison: str) :
+      - score_adjustment > 0 : bonus (compte business confirmé)
+      - score_adjustment < 0 : pénalité (profil personnel suspect)
+      - score_adjustment == 0 : neutre (inaccessible ou indéterminé)
+
+    Si Instagram est inaccessible (bio et display_name vides), retourne (0.0, neutre)
+    pour ne pas pénaliser injustement le score textuel existant.
+    """
+    if not bio and not display_name:
+        return 0.0, "Profil inaccessible ou bio vide — score textuel conservé."
+
+    bio_raw = (bio or "").lower()
+    display_raw = (display_name or "").lower()
+    combined_raw = bio_raw + " " + display_raw
+
+    bio_normalized = normalize_text(bio or "")
+    display_normalized = normalize_text(display_name or "")
+
+    # Détection des indicateurs personnels et business
+    personal_hits = [ind for ind in PERSONAL_INDICATORS if ind in combined_raw]
+    business_hits = [ind for ind in BUSINESS_INDICATORS if ind in combined_raw]
+
+    # Vérification si le nom affiché ou la bio contient les mots-clés de l'entreprise
+    company_keywords = extract_company_keywords(company_name)
+    name_match = any(kw in display_normalized for kw in company_keywords if len(kw) > 2)
+    bio_match = any(kw in bio_normalized for kw in company_keywords if len(kw) > 2)
+
+    if personal_hits and not business_hits:
+        # Profil clairement personnel, aucun indicateur business
+        return -35.0, (
+            f"Profil personnel suspect — indicateurs détectés : "
+            f"{', '.join(personal_hits[:3])}. Rejeté."
+        )
+    elif business_hits:
+        # Compte avec indicateurs business
+        bonus = min(12.0, len(business_hits) * 3.0)
+        hits_str = ", ".join(business_hits[:3])
+        raison = f"Compte business confirmé (indicateurs : {hits_str})."
+        if name_match or bio_match:
+            bonus += 5.0
+            raison += " Nom/bio cohérent avec l'entreprise."
+        return bonus, raison
+    elif name_match or bio_match:
+        # Pas d'indicateurs clairs mais le nom ou la bio mentionne l'entreprise
+        return 5.0, "Nom affiché ou bio contient des mots-clés de l'entreprise."
+    elif personal_hits:
+        # Quelques indicateurs personnels mais aussi ambiguïté
+        return -15.0, (
+            f"Profil ambigu — indicateurs personnels : {', '.join(personal_hits[:2])}. "
+            "Confiance réduite."
+        )
+    else:
+        return 0.0, "Aucun indicateur business ou personnel détecté — score textuel conservé."
 
 
 def validate_instagram_candidate(

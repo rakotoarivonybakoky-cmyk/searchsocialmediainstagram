@@ -15,6 +15,7 @@ from search_service import SearchService
 from progress_manager import ProgressManager
 from report_manager import ReportManager
 from processor import AutomationProcessor
+from email_service import EmailService
 
 
 def setup_logging(config: AppConfig) -> None:
@@ -114,6 +115,56 @@ def handle_status(config: AppConfig) -> int:
     return 0
 
 
+def handle_test_smtp(config: AppConfig) -> int:
+    """Envoie un email de test pour valider la configuration SMTP sans toucher à MongoDB."""
+    print("\n" + "=" * 50)
+    print("      TEST DE LA CONFIGURATION SMTP (GMAIL)      ")
+    print("=" * 50)
+    print(f"  SMTP Activé      : {'OUI' if config.smtp_enabled else 'NON (SMTP_ENABLED=false)'}")
+    print(f"  Serveur Hôte     : {config.smtp_host}")
+    print(f"  Port             : {config.smtp_port}")
+    print(f"  Chiffrement      : {'TLS (STARTTLS)' if config.smtp_use_tls else ('SSL direct' if config.smtp_use_ssl else 'Aucun')}")
+    print(f"  Expéditeur       : {config.smtp_user or '<Non configuré>'}")
+    print(f"  Destinataire     : {config.admin_email or '<Non configuré>'}")
+    print("-" * 50)
+
+    if not config.smtp_enabled:
+        print("[INFO] SMTP est désactivé dans votre .env (SMTP_ENABLED=false).")
+        print("Pour l'activer, configurez SMTP_ENABLED=true dans votre fichier .env.\n")
+        return 0
+
+    if not config.smtp_user or not config.smtp_password or not config.admin_email:
+        print("[ERREUR] Paramètres manquants dans .env (SMTP_USER, SMTP_PASSWORD ou ADMIN_EMAIL).")
+        print("Veuillez renseigner vos identifiants Gmail dans le fichier .env avant de tester.\n")
+        return 1
+
+    print("Tentative de connexion et d'envoi d'un email de test...")
+    email_service = EmailService(config)
+    success = email_service.send_email(
+        subject="[TEST SMTP] Pipeline Automatisation Instagram",
+        text_body=(
+            "Bonjour,\n\n"
+            "Ceci est un email de test confirmant que la configuration SMTP de votre "
+            "projet d'automatisation des liens Instagram est 100% opérationnelle.\n\n"
+            "Les futurs rapports d'automatisation et alertes d'erreurs seront correctement reçus.\n"
+        ),
+        html_body=(
+            "<div style='font-family: Arial, sans-serif; padding: 20px; border: 1px solid #2ea44f; border-radius: 8px;'>"
+            "<h2 style='color: #2ea44f; margin-top: 0;'>✔ Test SMTP Réussi</h2>"
+            "<p>Ce message confirme que la connexion SMTP vers Gmail fonctionne parfaitement.</p>"
+            "<p>Votre pipeline d'automatisation Instagram est prêt pour l'envoi automatique de rapports.</p>"
+            "</div>"
+        )
+    )
+
+    if success:
+        print(f"SUCCÈS : L'email de test a été envoyé avec succès à '{config.admin_email}'.\n")
+        return 0
+    else:
+        print("ÉCHEC : L'envoi de l'email de test a échoué. Vérifiez vos identifiants ou les logs.\n")
+        return 1
+
+
 def main() -> int:
     """Fonction principale du programme."""
     parser = argparse.ArgumentParser(
@@ -170,6 +221,11 @@ def main() -> int:
         choices=["HIGH", "MEDIUM", "LOW"],
         help="Seuil de confiance minimum pour écrire dans MongoDB (défaut : HIGH)."
     )
+    parser.add_argument(
+        "--test-smtp",
+        action="store_true",
+        help="Teste la configuration et l'envoi d'un email SMTP sans modifier MongoDB."
+    )
 
     args = parser.parse_args()
 
@@ -191,9 +247,13 @@ def main() -> int:
     if args.status:
         return handle_status(config)
 
+    if args.test_smtp:
+        return handle_test_smtp(config)
+
     # Initialisation des services pour le traitement
     provider = args.provider or config.search_provider
     confidence = args.confidence_threshold or config.confidence_threshold
+    email_service = EmailService(config)
 
     print("\n" + "=" * 68)
     print("  LANCEMENT DU TRAITEMENT D'ENRICHISSEMENT INSTAGRAM DANS MONGODB   ")
@@ -203,6 +263,7 @@ def main() -> int:
     print(f"  Reprise après arrêt       : {'OUI' if args.resume else 'NON (départ depuis le début)'}")
     print(f"  Fournisseur de recherche  : {provider}")
     print(f"  Seuil de confiance        : {confidence}")
+    print(f"  Notifications SMTP        : {'ACTIVÉES (' + config.admin_email + ')' if config.smtp_enabled and config.admin_email else ('DÉSACTIVÉES' if not config.smtp_enabled else 'INCOMPLÈTES')}")
     print("=" * 68 + "\n")
 
     db_service = MongoDBService(config)
@@ -210,6 +271,11 @@ def main() -> int:
         db_service.connect()
     except Exception as e:
         logger.error(f"Arrêt immédiat : impossible de se connecter à la base : {e}")
+        email_service.send_error_alert(
+            error_title="Échec de connexion MongoDB",
+            error_details=f"Impossible d'établir la connexion à la base MongoDB '{config.mongodb_db_name}' ({config.get_masked_uri()}).\nErreur : {e}",
+            context="Initialisation de db_service.connect() dans main.py"
+        )
         return 1
 
     search_service = SearchService(config, provider=provider)
@@ -229,7 +295,8 @@ def main() -> int:
         batch_size=args.batch_size,
         resume=args.resume,
         confidence_threshold=confidence,
-        only_with_website=only_with_web
+        only_with_website=only_with_web,
+        email_service=email_service
     )
 
     try:
@@ -237,6 +304,11 @@ def main() -> int:
         return 0
     except Exception as e:
         logger.exception(f"Erreur fatale d'exécution : {e}")
+        email_service.send_error_alert(
+            error_title="Erreur fatale du pipeline d'automatisation",
+            error_details=f"Une exception inattendue a interrompu le traitement : {e}",
+            context="Boucle principale processor.run() dans main.py"
+        )
         return 1
     finally:
         db_service.close()
