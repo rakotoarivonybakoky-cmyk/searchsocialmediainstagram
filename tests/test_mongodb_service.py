@@ -157,7 +157,7 @@ class TestMongoDBProtectionRules:
         # 1. Vérification que l'update est ciblé par _id
         assert filter_arg["_id"] == doc_id
         # 2. Vérification que la clause anti-doublon est active
-        assert filter_arg["socialAccounts.instagram.link"] == {"$ne": "https://www.instagram.com/sillyrama/"}
+        assert filter_arg["socialAccounts.instagram.url"] == {"$ne": "https://www.instagram.com/sillyrama/"}
         # 3. Vérification que $addToSet est utilisé (ne remplace pas socialAccounts)
         assert "$addToSet" in update_arg
         assert "socialAccounts.instagram" in update_arg["$addToSet"]
@@ -251,7 +251,7 @@ class TestMongoDBProtectionRules:
         assert stored[0]["match_percentage"] == 90.0
         assert stored[1]["match_percentage"] == 55.0
         assert stored[2]["match_percentage"] == 20.0
-        assert stored[0]["link"] == "https://instagram.com/best/"
+        assert stored[0]["url"] == "https://instagram.com/best/"
         assert "match_percentage" in stored[0]
 
     def test_update_instagram_candidates_dry_run(self, dummy_config):

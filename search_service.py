@@ -21,6 +21,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from instagram_validator import (
     clean_instagram_url,
     validate_instagram_candidate,
+    calculate_similarity,
     ValidationResult,
     analyze_bio_for_business
 )
@@ -325,14 +326,18 @@ class SearchService:
     ) -> List[ValidationResult]:
         """
         Trouve jusqu'à 3 profils Instagram candidats et les trie par pourcentage
-        de similarité décroissant (du plus pertinent au moins pertinent).
+        de similarité multi-rubriques décroissant (du plus pertinent au moins pertinent).
+        Prend en compte : companyName, url, domains, location, countryCode, description, keywords.
         """
-        company_name = company_data.get("companyName", "").strip()
+        company_name = (company_data.get("companyName") or company_data.get("tradeName") or "").strip()
         if not company_name:
             return []
 
-        location = company_data.get("location")
-        country_code = company_data.get("countryCode")
+        location = company_data.get("location") or None
+        country_code = company_data.get("countryCode") or None
+        description = company_data.get("description") or None
+        keywords_raw = company_data.get("keywords")
+        keywords: Optional[List[str]] = keywords_raw if isinstance(keywords_raw, list) else None
 
         urls_to_check: List[str] = []
         raw_url = company_data.get("url")
@@ -347,6 +352,7 @@ class SearchService:
 
         provider = self.provider
         candidates_map: Dict[str, ValidationResult] = {}
+        primary_domain = urls_to_check[0] if urls_to_check else None
 
         # 1. Extraction depuis le site officiel
         if provider in ("hybrid", "website_scraper"):
@@ -366,15 +372,17 @@ class SearchService:
             elif provider == "serpapi":
                 search_urls = self.search_serpapi_candidates(company_name, location, country_code)
 
-            primary_domain = urls_to_check[0] if urls_to_check else None
-
             for url in search_urls:
                 if url not in candidates_map:
                     val_res = validate_instagram_candidate(
                         candidate_url=url,
                         company_name=company_name,
                         domain=primary_domain,
-                        source="search_engine"
+                        source="search_engine",
+                        location=location,
+                        country_code=country_code,
+                        description=description,
+                        keywords=keywords
                     )
                     if val_res.is_valid and val_res.clean_url:
                         candidates_map[val_res.clean_url] = val_res
@@ -384,7 +392,7 @@ class SearchService:
         if not candidates_map:
             return []
 
-        # Tri décroissant selon le pourcentage de similarité
+        # Tri décroissant selon le pourcentage de similarité multi-rubriques
         sorted_candidates = sorted(
             candidates_map.values(),
             key=lambda x: x.similarity,
@@ -392,35 +400,43 @@ class SearchService:
         )
 
         # --- Vérification de la biographie Instagram ---
-        # Pour chaque candidat issu du moteur de recherche, on tente de récupérer
-        # les métadonnées publiques du profil (nom affiché + bio) afin de confirmer
-        # qu'il s'agit bien d'un compte d'entreprise et non d'un profil personnel.
-        # Si Instagram est inaccessible, le score textuel est conservé intact (neutre).
+        # Pour chaque candidat, on tente de récupérer les métadonnées publiques
+        # (nom affiché + bio) afin de recalculer le score multi-rubriques complet.
         top_to_verify = sorted_candidates[:max_candidates]
         for res in top_to_verify:
-            # Les liens extraits du site officiel ne nécessitent pas de vérification bio
             if res.clean_url and "official_website" not in res.reason:
                 meta = self._fetch_instagram_profile_meta(res.clean_url)
                 if meta:
-                    adjustment, bio_reason = analyze_bio_for_business(
-                        display_name=meta.get("display_name", ""),
-                        bio=meta.get("bio", ""),
-                        company_name=company_name
+                    display_name = meta.get("display_name", "")
+                    bio = meta.get("bio", "")
+
+                    # Recalcul complet du score avec toutes les rubriques MongoDB + bio Instagram
+                    new_sim = calculate_similarity(
+                        company_name=company_name,
+                        username=res.username or "",
+                        domain=primary_domain,
+                        source="search_engine",
+                        location=location,
+                        country_code=country_code,
+                        description=description,
+                        keywords=keywords,
+                        display_name=display_name,
+                        bio=bio
                     )
-                    if adjustment != 0.0:
-                        new_sim = round(max(0.0, min(100.0, res.similarity + adjustment)), 1)
-                        new_conf = (
-                            "HIGH" if new_sim >= 90.0
-                            else ("MEDIUM" if new_sim >= 60.0 else "LOW")
-                        )
-                        res.similarity = new_sim
-                        res.confidence = new_conf
-                        res.reason = f"{res.reason} | Bio : {bio_reason}"
-                        logger.debug(
-                            f"Bio vérifiée pour @{res.username} : "
-                            f"ajustement {adjustment:+.1f}% → {new_sim:.1f}% ({new_conf})"
-                        )
-                # Délai de courtoisie entre les requêtes vers Instagram
+                    new_conf = (
+                        "HIGH" if new_sim >= 90.0
+                        else ("MEDIUM" if new_sim >= 60.0 else "LOW")
+                    )
+                    res.similarity = new_sim
+                    res.confidence = new_conf
+                    res.reason = (
+                        f"Score multi-rubriques {new_sim:.1f}% "
+                        f"[Nom:{company_name} | Domaine:{primary_domain or 'N/A'} | "
+                        f"Pays:{country_code or 'N/A'} | Bio: {'oui' if bio else 'non'}]"
+                    )
+                    logger.debug(
+                        f"Score multi-rubriques pour @{res.username} : {new_sim:.1f}% ({new_conf})"
+                    )
                 time.sleep(1.0)
 
         # Re-tri après vérification des bios (scores peuvent avoir changé)

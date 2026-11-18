@@ -156,14 +156,17 @@ class MongoDBService:
 
         query: Dict[str, Any] = {"$and": query_conditions} if len(query_conditions) > 1 else query_conditions[0]
 
-        # Projection ciblée : récupération STRICTEMENT des champs nécessaires
+        # Projection ciblée : récupération des champs nécessaires au calcul multi-rubriques
         projection = {
             "_id": 1,
             "companyName": 1,
+            "tradeName": 1,
             "domains": 1,
             "url": 1,
             "location": 1,
             "countryCode": 1,
+            "description": 1,
+            "keywords": 1,
             "socialAccounts": 1
         }
 
@@ -212,7 +215,7 @@ class MongoDBService:
         ig_list = social_accounts.get("instagram")
         if isinstance(ig_list, list) and len(ig_list) > 0:
             for item in ig_list:
-                link = item.get("link", "") if isinstance(item, dict) else str(item)
+                link = (item.get("url") or item.get("URL") or item.get("link", "")) if isinstance(item, dict) else str(item)
                 clean = link.strip().rstrip("/")
                 if clean and clean not in ("https://instagram.com", "http://instagram.com", "https://www.instagram.com", "http://www.instagram.com", "instagram.com"):
                     return True
@@ -241,7 +244,7 @@ class MongoDBService:
         if not candidates:
             return {"success": False, "modified": False, "status": "no_candidates", "reason": "Aucun candidat fourni"}
 
-        # Préparation des objets avec link, name et match_percentage
+        # Préparation des objets avec url, name et match_percentage
         # Les liens vides (sans nom d'utilisateur) sont ignorés
         INVALID_LINKS = {
             "https://instagram.com", "http://instagram.com",
@@ -251,7 +254,7 @@ class MongoDBService:
 
         formatted_entries = []
         for c in candidates:
-            url = getattr(c, "clean_url", None) or (c.get("link") if isinstance(c, dict) else None)
+            url = getattr(c, "clean_url", None) or (c.get("url") or c.get("URL") or c.get("link") if isinstance(c, dict) else None)
             user = getattr(c, "username", None) or (c.get("name") if isinstance(c, dict) else None) or company_name
             sim = getattr(c, "similarity", 0.0) if hasattr(c, "similarity") else (c.get("match_percentage", c.get("similarity", 0.0)) if isinstance(c, dict) else 0.0)
 
@@ -262,7 +265,7 @@ class MongoDBService:
                 continue
 
             formatted_entries.append({
-                "link": url,
+                "url": url,
                 "name": user,
                 "match_percentage": round(float(sim), 1)
             })
@@ -319,7 +322,6 @@ class MongoDBService:
         Règles :
         - Ciblage strict par _id.
         - Empêche l'ajout de doublons (vérification link $ne).
-        - Ne touche à aucune autre clé de socialAccounts (facebook, linkedin, etc.).
         - Ne modifie aucun champ calculé.
         """
         if dry_run:
@@ -332,7 +334,7 @@ class MongoDBService:
             }
 
         new_entry = {
-            "link": instagram_link,
+            "url": instagram_link,
             "name": company_name
         }
 
@@ -361,7 +363,7 @@ class MongoDBService:
 
             # Vérification de doublon
             for item in existing_ig:
-                if isinstance(item, dict) and item.get("link") == instagram_link:
+                if isinstance(item, dict) and (item.get("url") == instagram_link or item.get("URL") == instagram_link or item.get("link") == instagram_link):
                     return {
                         "success": True,
                         "modified": False,
@@ -372,7 +374,7 @@ class MongoDBService:
             # 2. Mise à jour atomique avec filtre d'exclusion de doublon
             filter_query = {
                 "_id": doc_id,
-                "socialAccounts.instagram.link": {"$ne": instagram_link}
+                "socialAccounts.instagram.url": {"$ne": instagram_link}
             }
 
             update_operation = {
@@ -386,7 +388,14 @@ class MongoDBService:
             if result.matched_count == 0:
                 # Si non matché, revérifions si c'était parce que le lien était déjà présent
                 check = self.collection.find_one(
-                    {"_id": doc_id, "socialAccounts.instagram.link": instagram_link},
+                    {
+                        "_id": doc_id,
+                        "$or": [
+                            {"socialAccounts.instagram.url": instagram_link},
+                            {"socialAccounts.instagram.URL": instagram_link},
+                            {"socialAccounts.instagram.link": instagram_link}
+                        ]
+                    },
                     {"_id": 1}
                 )
                 if check:

@@ -135,12 +135,22 @@ def calculate_similarity(
     company_name: str,
     username: str,
     domain: Optional[str] = None,
-    source: str = "search_engine"
+    source: str = "search_engine",
+    location: Optional[str] = None,
+    country_code: Optional[str] = None,
+    description: Optional[str] = None,
+    keywords: Optional[List[str]] = None,
+    display_name: Optional[str] = None,
+    bio: Optional[str] = None
 ) -> float:
     """
-    Calcule un pourcentage de similarité réaliste et différencié (0.0% à 100.0%)
-    entre le nom d'entreprise et le compte Instagram.
-    Chaque variation (ex: ajout de chiffres, de pays, de mots) produit un score distinct.
+    Calcule un pourcentage de similarité multi-rubriques (0.0% à 100.0%)
+    prenant en compte l'ensemble des informations de l'entreprise dans MongoDB :
+      1. Nom de l'entreprise (companyName / tradeName vs username / display_name) : 40%
+      2. Site web et domaines (url / domains vs Instagram / bio)                   : 30%
+      3. Localisation géographique (location / countryCode vs bio / profil)        : 15%
+      4. Secteur d'activité et description (description / keywords vs bio)         : 15%
+    Lorsque toutes les rubriques concordent parfaitement, le score atteint 100.0%.
     """
     raw_c = normalize_text(company_name)
     raw_u = normalize_text(username)
@@ -148,43 +158,141 @@ def calculate_similarity(
     if not raw_c or not raw_u:
         return 0.0
 
-    # 1. Correspondance exacte parfaite
-    if raw_c == raw_u:
-        return 100.0
+    bio_lower = (bio or "").lower()
+    display_lower = (display_name or "").lower()
+    combined_bio = f"{bio_lower} {display_lower}"
 
-    # 2. Nettoyage des termes légaux / suffixes d'entreprise
+    # =========================================================================
+    # 1. RUBRIQUE NOM D'ENTREPRISE (40 POINTS MAX)
+    # =========================================================================
     keywords_c = extract_company_keywords(company_name)
     clean_c = "".join(keywords_c)
     clean_u = re.sub(r"[._0-9]", "", raw_u)
 
-    if clean_c and clean_u and clean_c == clean_u:
-        # Correspondance exacte après retrait des formes juridiques et séparateurs
-        score = 95.0
+    if raw_c == raw_u:
+        name_ratio = 1.0
+    elif clean_c and clean_u and clean_c == clean_u:
+        name_ratio = 0.95
     else:
-        # 3. Ratio de Levenshtein (caractère par caractère)
         ratio_raw = SequenceMatcher(None, raw_c, raw_u).ratio()
         ratio_clean = SequenceMatcher(None, clean_c, clean_u).ratio() if clean_c and clean_u else 0.0
         base_ratio = max(ratio_raw, ratio_clean)
-
-        # 4. Pénalité de longueur proportionnelle si le handle a des caractères en trop ou en moins
         len_factor = min(len(raw_c), len(raw_u)) / max(len(raw_c), len(raw_u))
+        name_ratio = base_ratio * 0.70 + len_factor * 0.30
 
-        # 5. Score combiné pondéré
-        score = (base_ratio * 0.70 + len_factor * 0.30) * 100.0
+    # Prise en compte du nom affiché (display_name) s'il valide l'entreprise
+    if display_name:
+        dn_norm = normalize_text(display_name)
+        if raw_c in dn_norm or (clean_c and clean_c in dn_norm):
+            name_ratio = min(1.0, name_ratio + 0.08)
 
-        # Prise en compte du nom de domaine si pertinent
-        if domain:
-            clean_dom = re.sub(r"^https?://", "", domain.lower()).split("/")[0].replace("www.", "")
-            dom_slug = normalize_text(clean_dom.split(".")[0])
-            if dom_slug and dom_slug in raw_u:
-                dom_ratio = SequenceMatcher(None, dom_slug, raw_u).ratio()
-                score = max(score, (dom_ratio * 0.75 + 0.20) * 100.0)
+    name_score = name_ratio * 40.0
 
-    # Si le lien est extrait du site web officiel, léger bonus de légitimité sans masquer les différences
+    # =========================================================================
+    # 2. RUBRIQUE SITE WEB ET DOMAINE (30 POINTS MAX)
+    # =========================================================================
     if source == "official_website":
-        score = min(100.0, score + 8.0)
+        # Le lien a été extrait directement du site officiel de l'entreprise
+        domain_score = 30.0
+    elif domain:
+        clean_dom = re.sub(r"^https?://", "", domain.lower()).split("/")[0].replace("www.", "")
+        dom_slug = normalize_text(clean_dom.split(".")[0])
 
-    return round(max(0.0, min(score, 100.0)), 1)
+        if clean_dom and clean_dom in bio_lower:
+            # Le nom de domaine exact apparaît dans la bio Instagram
+            domain_score = 30.0
+        elif dom_slug and dom_slug in raw_u:
+            # Le slug du domaine apparaît dans le pseudo Instagram
+            dom_ratio = SequenceMatcher(None, dom_slug, raw_u).ratio()
+            domain_score = max(20.0, (dom_ratio * 0.8 + 0.2) * 30.0)
+        elif dom_slug and dom_slug in bio_lower:
+            domain_score = 25.0
+        else:
+            domain_score = 15.0 * name_ratio
+    else:
+        # Aucun site web renseigné dans MongoDB : score pondéré selon le nom
+        domain_score = 30.0 * name_ratio
+
+    # =========================================================================
+    # 3. RUBRIQUE GÉOGRAPHIE ET LOCALISATION (15 POINTS MAX)
+    # =========================================================================
+    country_names_map = {
+        "fr": ["france", "fr"],
+        "be": ["belgique", "belgium"],
+        "ch": ["suisse", "switzerland"],
+        "ca": ["canada", "quebec"],
+        "mg": ["madagascar", "mada"],
+        "us": ["usa", "united states", "etats-unis"],
+        "uk": ["uk", "united kingdom", "royaume-uni"],
+        "de": ["germany", "deutschland", "allemagne"],
+        "es": ["espana", "spain", "espagne"],
+        "it": ["italia", "italy", "italie"]
+    }
+
+    geo_tokens: Set[str] = set()
+    if country_code:
+        cc_lower = country_code.lower().strip()
+        geo_tokens.add(cc_lower)
+        for alias in country_names_map.get(cc_lower, []):
+            geo_tokens.add(alias)
+
+    if location:
+        cleaned_loc = unicodedata.normalize("NFKD", location).encode("ASCII", "ignore").decode("utf-8").lower()
+        for token in re.findall(r"[a-z]{3,}", cleaned_loc):
+            geo_tokens.add(token)
+
+    if geo_tokens and combined_bio:
+        if any(re.search(rf"\b{re.escape(token)}\b", combined_bio) for token in geo_tokens):
+            geo_score = 15.0
+        else:
+            geo_score = 10.0 * name_ratio
+    else:
+        geo_score = 15.0 * name_ratio
+
+    # =========================================================================
+    # 4. RUBRIQUE SECTEUR D'ACTIVITÉ ET DESCRIPTION (15 POINTS MAX)
+    # =========================================================================
+    sector_tokens: Set[str] = set()
+    if keywords:
+        for kw in keywords:
+            if isinstance(kw, str) and len(kw) > 2:
+                sector_tokens.add(kw.lower().strip())
+
+    if description:
+        cleaned_desc = unicodedata.normalize("NFKD", description).encode("ASCII", "ignore").decode("utf-8").lower()
+        stopwords = {"pour", "dans", "avec", "cette", "notre", "votre", "nous", "vous", "societe", "entreprise"}
+        desc_words = [w for w in re.findall(r"[a-z]{4,}", cleaned_desc) if w not in stopwords]
+        sector_tokens.update(desc_words[:8])
+
+    has_sector_match = False
+    if sector_tokens and combined_bio:
+        has_sector_match = any(re.search(rf"\b{re.escape(t)}\b", combined_bio) for t in sector_tokens)
+
+    # Détection des indicateurs professionnels vs personnels
+    has_business_ind = any(ind in combined_bio for ind in BUSINESS_INDICATORS)
+    has_personal_ind = any(ind in combined_bio for ind in PERSONAL_INDICATORS)
+
+    if has_sector_match:
+        sector_score = 15.0
+    elif has_business_ind:
+        sector_score = 12.0
+    elif has_personal_ind and not has_business_ind:
+        # Pénalité forte si le compte est clairement personnel (mannequin, gamer, etc.)
+        sector_score = -20.0
+    else:
+        sector_score = 15.0 * name_ratio
+
+    # =========================================================================
+    # SCORE FINAL PONDÉRÉ MULTI-CRITÈRES (100% QUAND TOUT CORRESPOND)
+    # =========================================================================
+    total_score = name_score + domain_score + geo_score + sector_score
+
+    # Bonus de source officielle si applicable
+    if source == "official_website" and name_ratio >= 0.85:
+        total_score = max(total_score, 95.0 if name_ratio < 1.0 else 100.0)
+
+    final_score = round(max(0.0, min(total_score, 100.0)), 1)
+    return final_score
 
 
 def calculate_confidence(
@@ -192,18 +300,35 @@ def calculate_confidence(
     username: str,
     company_name: str,
     domain: Optional[str] = None,
-    source: str = "search_engine"
+    source: str = "search_engine",
+    location: Optional[str] = None,
+    country_code: Optional[str] = None,
+    description: Optional[str] = None,
+    keywords: Optional[List[str]] = None,
+    display_name: Optional[str] = None,
+    bio: Optional[str] = None
 ) -> tuple[str, str, float]:
     """
-    Détermine le niveau de confiance (HIGH, MEDIUM, LOW), la raison et la similarité.
+    Détermine le niveau de confiance (HIGH, MEDIUM, LOW), la raison et la similarité multi-rubriques.
     """
-    similarity = calculate_similarity(company_name, username, domain, source)
+    similarity = calculate_similarity(
+        company_name=company_name,
+        username=username,
+        domain=domain,
+        source=source,
+        location=location,
+        country_code=country_code,
+        description=description,
+        keywords=keywords,
+        display_name=display_name,
+        bio=bio
+    )
 
     if source == "official_website":
         return "HIGH", f"Lien extrait du site web officiel (similarité: {similarity}%).", similarity
 
     if similarity >= 90.0:
-        return "HIGH", f"Forte concordance ({similarity}%) entre l'entreprise et le compte '{username}'.", similarity
+        return "HIGH", f"Forte concordance multi-rubriques ({similarity}%) avec le compte '{username}'.", similarity
     elif similarity >= 60.0:
         return "MEDIUM", f"Concordance modérée ({similarity}%) avec le compte '{username}'.", similarity
     else:
@@ -278,10 +403,16 @@ def validate_instagram_candidate(
     candidate_url: str,
     company_name: str,
     domain: Optional[str] = None,
-    source: str = "search_engine"
+    source: str = "search_engine",
+    location: Optional[str] = None,
+    country_code: Optional[str] = None,
+    description: Optional[str] = None,
+    keywords: Optional[List[str]] = None,
+    display_name: Optional[str] = None,
+    bio: Optional[str] = None
 ) -> ValidationResult:
     """
-    Fonction de validation d'un candidat Instagram avec calcul du pourcentage de similarité.
+    Fonction de validation d'un candidat Instagram avec calcul du pourcentage de similarité multi-rubriques.
     """
     clean_url = clean_instagram_url(candidate_url)
     if not clean_url:
@@ -300,7 +431,13 @@ def validate_instagram_candidate(
         username=username,
         company_name=company_name,
         domain=domain,
-        source=source
+        source=source,
+        location=location,
+        country_code=country_code,
+        description=description,
+        keywords=keywords,
+        display_name=display_name,
+        bio=bio
     )
 
     return ValidationResult(
